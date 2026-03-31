@@ -37,3 +37,11 @@ Install the following libraries via the Arduino IDE Library Manager:
 3. Update the credentials in the code:
    - `WIFI_SSID` and `WIFI_PASS`
    - `APP_KEY`, `APP_SECRET`, and `GARAGE_DOOR_ID`
+
+## Serial Monitor Commands
+After uploading, open the Serial Monitor at `115200` baud and send one of the commands below:
+
+- `W`  Show connected Wi-Fi network and IP address
+- `S`  Show SinricPro connection status
+- `SE` Show reed sensors state (OPEN/CLOSED) and detection flags since boot
+- `H`  Show help
