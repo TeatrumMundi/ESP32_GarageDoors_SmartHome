@@ -36,6 +36,11 @@
 bool isDoorClosed = true;           
 bool lastSensorClosedState = HIGH;  
 bool lastSensorOpenState = HIGH;    
+bool isSinricConnected = false;
+bool closedSensorTriggered = false;
+bool openSensorTriggered = false;
+
+String serialCommandBuffer = "";
 
 // ======================================================================
 // HELPER FUNCTIONS
@@ -43,6 +48,72 @@ bool lastSensorOpenState = HIGH;
 void updateInternalLED() {
   // Built-in LED turns on when the door is OPEN (!isDoorClosed)
   digitalWrite(LED_BUILTIN, isDoorClosed ? LOW : HIGH);
+}
+
+void printHelp() {
+  Serial.println("[Console] Available commands:");
+  Serial.println("  W    Show connected Wi-Fi network");
+  Serial.println("  S    Show SinricPro connection status");
+  Serial.println("  SE   Show sensors status");
+  Serial.println("  H    Show this help");
+}
+
+void printWiFiStatus() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[Console] Wi-Fi connected to: %s\n", WiFi.SSID().c_str());
+    Serial.printf("[Console] IP Address: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("[Console] Wi-Fi is not connected.");
+  }
+}
+
+void printSinricStatus() {
+  Serial.printf("[Console] SinricPro status: %s\n", isSinricConnected ? "CONNECTED" : "DISCONNECTED");
+}
+
+void printSensorsStatus() {
+  bool currentClosedActive = (digitalRead(SENSOR_CLOSED_PIN) == LOW);
+  bool currentOpenActive = (digitalRead(SENSOR_OPEN_PIN) == LOW);
+
+  Serial.println("[Console] Sensors status:");
+  Serial.printf("  CLOSED sensor (GPIO %d): %s\n", SENSOR_CLOSED_PIN, currentClosedActive ? "ACTIVE" : "INACTIVE");
+  Serial.printf("  OPEN sensor   (GPIO %d): %s\n", SENSOR_OPEN_PIN, currentOpenActive ? "ACTIVE" : "INACTIVE");
+  Serial.printf("  CLOSED sensor detected since boot: %s\n", closedSensorTriggered ? "YES" : "NO");
+  Serial.printf("  OPEN sensor detected since boot: %s\n", openSensorTriggered ? "YES" : "NO");
+}
+
+void handleSerialCommands() {
+  while (Serial.available() > 0) {
+    char ch = (char)Serial.read();
+
+    if (ch == '\r') {
+      continue;
+    }
+
+    if (ch == '\n') {
+      serialCommandBuffer.trim();
+      serialCommandBuffer.toUpperCase();
+
+      if (serialCommandBuffer.length() > 0) {
+        if (serialCommandBuffer == "W") {
+          printWiFiStatus();
+        } else if (serialCommandBuffer == "S") {
+          printSinricStatus();
+        } else if (serialCommandBuffer == "SE") {
+          printSensorsStatus();
+        } else if (serialCommandBuffer == "H") {
+          printHelp();
+        } else {
+          Serial.printf("[Console] Unknown command: %s\n", serialCommandBuffer.c_str());
+          Serial.println("[Console] Type H for help.");
+        }
+      }
+
+      serialCommandBuffer = "";
+    } else {
+      serialCommandBuffer += ch;
+    }
+  }
 }
 
 // ======================================================================
@@ -74,6 +145,7 @@ void handleSensors() {
   if (currentClosedState == LOW && lastSensorClosedState == HIGH) {
     Serial.println("[Sensors] Door is now CLOSED");
     isDoorClosed = true;
+    closedSensorTriggered = true;
     updateInternalLED();
     myGarageDoor.sendDoorStateEvent(true);
   }
@@ -82,6 +154,7 @@ void handleSensors() {
   if (currentOpenState == LOW && lastSensorOpenState == HIGH) {
     Serial.println("[Sensors] Door is now OPEN");
     isDoorClosed = false;
+    openSensorTriggered = true;
     updateInternalLED();
     myGarageDoor.sendDoorStateEvent(false);
   }
@@ -108,8 +181,14 @@ void setupSinricPro() {
   SinricProGarageDoor &myGarageDoor = SinricPro[GARAGE_DOOR_ID];
   myGarageDoor.onDoorState(onDoorState);
 
-  SinricPro.onConnected([](){ Serial.println("[SinricPro] Connected to cloud."); }); 
-  SinricPro.onDisconnected([](){ Serial.println("[SinricPro] Disconnected from cloud."); });
+  SinricPro.onConnected([](){
+    isSinricConnected = true;
+    Serial.println("[SinricPro] Connected to cloud.");
+  });
+  SinricPro.onDisconnected([](){
+    isSinricConnected = false;
+    Serial.println("[SinricPro] Disconnected from cloud.");
+  });
   
   SinricPro.begin(APP_KEY, APP_SECRET);
 }
@@ -130,6 +209,7 @@ void setup() {
 
   setupWiFi();
   setupSinricPro();
+  printHelp();
 }
 
 // ======================================================================
@@ -138,4 +218,5 @@ void setup() {
 void loop() {
   SinricPro.handle(); // Maintain WebSocket stack
   handleSensors();    // Poll digital inputs
+  handleSerialCommands(); // Handle Serial Monitor commands
 }
