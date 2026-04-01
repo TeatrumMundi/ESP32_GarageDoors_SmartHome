@@ -25,8 +25,10 @@
 // ======================================================================
 #define RELAY_PIN         5   // Relay Control (Open-Drain)
 #define SENSOR_CLOSED_PIN 14  // CLOSED Reed Switch (Active Low)
-#define SENSOR_OPEN_PIN   12  // OPEN Reed Switch (Active Low)
 #define LED_BUILTIN       2   // Onboard Status LED
+
+// Sensor usage configuration
+#define USE_SENSOR_CLOSED true  // true = use CLOSED sensor to determine state
 
 #define BAUD_RATE         115200
 
@@ -35,12 +37,21 @@
 // ======================================================================
 bool isDoorClosed = true;           
 bool lastSensorClosedState = HIGH;  
-bool lastSensorOpenState = HIGH;    
 bool isSinricConnected = false;
 bool closedSensorTriggered = false;
-bool openSensorTriggered = false;
+
+enum DoorPosition {
+  DOOR_CLOSED,
+  DOOR_OPEN,
+  DOOR_MOVING,
+  DOOR_UNKNOWN
+};
+
+DoorPosition currentDoorPosition = DOOR_CLOSED;
 
 String serialCommandBuffer = "";
+
+const bool SENSOR_MODE_ENABLED = USE_SENSOR_CLOSED;
 
 // ======================================================================
 // HELPER FUNCTIONS
@@ -71,15 +82,22 @@ void printSinricStatus() {
   Serial.printf("[Console] SinricPro status: %s\n", isSinricConnected ? "CONNECTED" : "DISCONNECTED");
 }
 
+const char* doorPositionToString(DoorPosition position) {
+  switch (position) {
+    case DOOR_CLOSED: return "CLOSED";
+    case DOOR_OPEN: return "OPEN";
+    case DOOR_MOVING: return "MOVING";
+    default: return "UNKNOWN";
+  }
+}
+
 void printSensorsStatus() {
-  bool currentClosedActive = (digitalRead(SENSOR_CLOSED_PIN) == LOW);
-  bool currentOpenActive = (digitalRead(SENSOR_OPEN_PIN) == LOW);
+  bool currentClosedActive = USE_SENSOR_CLOSED && (digitalRead(SENSOR_CLOSED_PIN) == LOW);
 
   Serial.println("[Console] Sensors status:");
-  Serial.printf("  CLOSED sensor (GPIO %d): %s\n", SENSOR_CLOSED_PIN, currentClosedActive ? "ACTIVE" : "INACTIVE");
-  Serial.printf("  OPEN sensor   (GPIO %d): %s\n", SENSOR_OPEN_PIN, currentOpenActive ? "ACTIVE" : "INACTIVE");
+  Serial.printf("  CLOSED sensor (GPIO %d): %s (%s)\n", SENSOR_CLOSED_PIN, currentClosedActive ? "ACTIVE" : "INACTIVE", USE_SENSOR_CLOSED ? "ENABLED" : "DISABLED");
   Serial.printf("  CLOSED sensor detected since boot: %s\n", closedSensorTriggered ? "YES" : "NO");
-  Serial.printf("  OPEN sensor detected since boot: %s\n", openSensorTriggered ? "YES" : "NO");
+  Serial.printf("  Derived door position: %s\n", doorPositionToString(currentDoorPosition));
 }
 
 void handleSerialCommands() {
@@ -127,41 +145,70 @@ bool onDoorState(const String &deviceId, bool &state) {
   delay(500);                     
   digitalWrite(RELAY_PIN, HIGH);  // High-Impedance (Hi-Z) state: Relay released
 
-  isDoorClosed = state;
-  updateInternalLED();
+  // When sensors are enabled, cloud state must follow the physical position, not the requested one.
+  if (!SENSOR_MODE_ENABLED) {
+    isDoorClosed = state;
+    updateInternalLED();
+    return true;
+  }
 
-  return true; 
+  bool closedActive = USE_SENSOR_CLOSED && (digitalRead(SENSOR_CLOSED_PIN) == LOW);
+  SinricProGarageDoor &myGarageDoor = SinricPro[GARAGE_DOOR_ID];
+
+  if (closedActive) {
+    isDoorClosed = true;
+    currentDoorPosition = DOOR_CLOSED;
+    closedSensorTriggered = true;
+    updateInternalLED();
+    myGarageDoor.sendDoorStateEvent(true);
+    Serial.println("[Sensors] Resync after command: CLOSED");
+  } else {
+    isDoorClosed = false;
+    currentDoorPosition = DOOR_OPEN;
+    Serial.println("[Sensors] Resync after command: OPEN");
+    updateInternalLED();
+    myGarageDoor.sendDoorStateEvent(false);
+  }
+
+  return true;
 }
 
 // ======================================================================
 // SENSOR POLLING (ESP32 -> Google Home)
 // ======================================================================
 void handleSensors() {
-  bool currentClosedState = digitalRead(SENSOR_CLOSED_PIN);
-  bool currentOpenState = digitalRead(SENSOR_OPEN_PIN);
+  bool currentClosedState = USE_SENSOR_CLOSED ? digitalRead(SENSOR_CLOSED_PIN) : HIGH;
+  bool closedActive = USE_SENSOR_CLOSED && (currentClosedState == LOW);
   SinricProGarageDoor &myGarageDoor = SinricPro[GARAGE_DOOR_ID];
 
   // Detect falling edge - Door has reached the CLOSED position
-  if (currentClosedState == LOW && lastSensorClosedState == HIGH) {
+  if (USE_SENSOR_CLOSED && currentClosedState == LOW && lastSensorClosedState == HIGH) {
     Serial.println("[Sensors] Door is now CLOSED");
     isDoorClosed = true;
+    currentDoorPosition = DOOR_CLOSED;
     closedSensorTriggered = true;
     updateInternalLED();
     myGarageDoor.sendDoorStateEvent(true);
   }
 
-  // Detect falling edge - Door has reached the OPEN position
-  if (currentOpenState == LOW && lastSensorOpenState == HIGH) {
-    Serial.println("[Sensors] Door is now OPEN");
+  // Detect release edge - Door is no longer in the CLOSED position
+  if (USE_SENSOR_CLOSED && currentClosedState == HIGH && lastSensorClosedState == LOW) {
+    Serial.println("[Sensors] Door is no longer CLOSED (reported as OPEN)");
     isDoorClosed = false;
-    openSensorTriggered = true;
+    currentDoorPosition = DOOR_OPEN;
     updateInternalLED();
     myGarageDoor.sendDoorStateEvent(false);
   }
 
+  isDoorClosed = closedActive;
+  if (closedActive) {
+    currentDoorPosition = DOOR_CLOSED;
+  } else if (currentDoorPosition != DOOR_OPEN) {
+    currentDoorPosition = DOOR_OPEN;
+  }
+
   // Buffer states for the next cycle
   lastSensorClosedState = currentClosedState;
-  lastSensorOpenState = currentOpenState;
 }
 
 // ======================================================================
@@ -204,8 +251,22 @@ void setup() {
   updateInternalLED();
 
   // Internal pull-up resistors to prevent floating logic states
-  pinMode(SENSOR_CLOSED_PIN, INPUT_PULLUP);
-  pinMode(SENSOR_OPEN_PIN, INPUT_PULLUP);
+  if (USE_SENSOR_CLOSED) {
+    pinMode(SENSOR_CLOSED_PIN, INPUT_PULLUP);
+  }
+
+  // Initialize current state from sensors if sensor mode is enabled.
+  if (SENSOR_MODE_ENABLED) {
+    if (USE_SENSOR_CLOSED && digitalRead(SENSOR_CLOSED_PIN) == LOW) {
+      isDoorClosed = true;
+      currentDoorPosition = DOOR_CLOSED;
+      closedSensorTriggered = true;
+    } else {
+      isDoorClosed = false;
+      currentDoorPosition = DOOR_OPEN;
+    }
+    updateInternalLED();
+  }
 
   setupWiFi();
   setupSinricPro();
